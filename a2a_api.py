@@ -20,11 +20,15 @@ LICENTA: AGPL-3.0 / commercial dual license.
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+import secrets
+
+from fastapi import FastAPI, HTTPException, Query, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from a2a_oversight import (
@@ -177,12 +181,15 @@ class AuditResponse(BaseModel):
 
 engine = A2AOversightEngine(seed=42)
 
+_is_prod = os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("AMIDOR_ENV") == "prod"
+
 app = FastAPI(
     title="AntetAI A2A Oversight API",
     description="Agent-to-Agent oversight — antetai as arbiter between autonomous AI agents",
     version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
 )
 
 app.add_middleware(
@@ -191,6 +198,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ═══════════════════════════════════════════════════════════════════
+# API KEY AUTH
+# ═══════════════════════════════════════════════════════════════════
+
+_API_KEY = os.environ.get("ANTETAI_API_KEY", "")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def require_api_key(key: str = Security(_api_key_header)):
+    if not _API_KEY:
+        return
+    if not key or not secrets.compare_digest(key, _API_KEY):
+        raise HTTPException(401, "Invalid or missing API key")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -253,7 +273,8 @@ def _verdict_to_response(v) -> VerdictResponse:
 # AGENT ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════
 
-@app.post("/agents/register", response_model=AgentResponse, tags=["agents"])
+@app.post("/agents/register", response_model=AgentResponse, tags=["agents"],
+          dependencies=[Depends(require_api_key)])
 async def register_agent(req: AgentRegisterRequest):
     if req.agent_id in engine.registry:
         raise HTTPException(409, f"Agent '{req.agent_id}' already registered")
@@ -266,14 +287,15 @@ async def register_agent(req: AgentRegisterRequest):
     )
     return engine.get_agent_report(req.agent_id)
 
-@app.get("/agents/{agent_id}", response_model=AgentResponse, tags=["agents"])
+@app.get("/agents/{agent_id}", response_model=AgentResponse, tags=["agents"],
+         dependencies=[Depends(require_api_key)])
 async def get_agent(agent_id: str):
     report = engine.get_agent_report(agent_id)
     if "error" in report:
         raise HTTPException(404, report["error"])
     return report
 
-@app.get("/agents", tags=["agents"])
+@app.get("/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
 async def list_agents():
     return {
         "agents": [
@@ -295,7 +317,8 @@ async def list_agents():
 # EVALUATION ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════
 
-@app.post("/evaluate", response_model=VerdictResponse, tags=["oversight"])
+@app.post("/evaluate", response_model=VerdictResponse, tags=["oversight"],
+          dependencies=[Depends(require_api_key)])
 async def evaluate_message(req: MessageRequest):
     msg = A2AMessage(
         sender_id=req.sender_id,
@@ -308,7 +331,8 @@ async def evaluate_message(req: MessageRequest):
     verdict = engine.evaluate(msg)
     return _verdict_to_response(verdict)
 
-@app.post("/evaluate/batch", response_model=BatchVerdictResponse, tags=["oversight"])
+@app.post("/evaluate/batch", response_model=BatchVerdictResponse, tags=["oversight"],
+          dependencies=[Depends(require_api_key)])
 async def evaluate_batch(req: BatchMessageRequest):
     t0 = time.perf_counter()
     results = []
@@ -331,7 +355,8 @@ async def evaluate_batch(req: BatchMessageRequest):
 # STANDALONE ANTETAI STAMP
 # ═══════════════════════════════════════════════════════════════════
 
-@app.post("/antetai/stamp", response_model=StampResponse, tags=["antetai"])
+@app.post("/antetai/stamp", response_model=StampResponse, tags=["antetai"],
+          dependencies=[Depends(require_api_key)])
 async def stamp_text(req: StampRequest):
     r = engine.antetai.analyze(req.text)
     return StampResponse(
@@ -355,8 +380,13 @@ async def stamp_text(req: StampRequest):
 # SYSTEM ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════
 
-@app.get("/health", response_model=HealthResponse, tags=["system"])
-async def system_health():
+@app.get("/health", tags=["system"])
+async def system_health_public():
+    return {"status": "ok", "version": A2AOversightEngine.VERSION}
+
+@app.get("/health/detailed", response_model=HealthResponse, tags=["system"],
+         dependencies=[Depends(require_api_key)])
+async def system_health_detailed():
     h = engine.system_health()
     return HealthResponse(
         status=h.get("status", "no_agents"),
@@ -371,7 +401,8 @@ async def system_health():
         engine_version=A2AOversightEngine.VERSION,
     )
 
-@app.get("/audit", response_model=AuditResponse, tags=["system"])
+@app.get("/audit", response_model=AuditResponse, tags=["system"],
+         dependencies=[Depends(require_api_key)])
 async def audit_log(
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),

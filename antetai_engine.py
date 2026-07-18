@@ -226,7 +226,8 @@ class AntetaiEngine:
         antetai_score = self._compute_final_score(
             primary.risk_score, coordination, entropy,
             weac_coherence, cross_concordance,
-            scam_intercepted, gate_mode
+            scam_intercepted, gate_mode,
+            pillar_scores=pillar_scores,
         )
         antetai_label = _classify_antetai(antetai_score)
 
@@ -306,17 +307,40 @@ class AntetaiEngine:
 
     def _compute_final_score(self, tve_risk, coordination, entropy,
                              weac_coherence, cross_concordance,
-                             scam_intercepted, gate_mode):
+                             scam_intercepted, gate_mode,
+                             pillar_scores=None):
         if scam_intercepted:
             return min(0.95, tve_risk + 0.4)
 
+        # Path A: TVE multiplicative (original)
         base = tve_risk
         coord_factor = 1.0 + 0.4 * coordination
         entropy_factor = max(0.3, 1.0 - entropy * 0.4)
         consensus_factor = 1.0 + 0.2 * (weac_coherence - 0.5)
         cross_factor = 1.0 + 0.15 * max(0, cross_concordance - 0.5)
+        tve_path = base * coord_factor * entropy_factor * consensus_factor * cross_factor
 
-        score = base * coord_factor * entropy_factor * consensus_factor * cross_factor
+        # Path B: Direct pillar aggregation (prevents score compression)
+        pillar_path = 0.0
+        if pillar_scores:
+            active = sorted(
+                [v for v in pillar_scores.values() if v >= 0.20],
+                reverse=True
+            )
+            n = len(active)
+            if n >= 3:
+                pillar_path = 0.40 * active[0] + 0.30 * active[1] + 0.30 * float(np.mean(active[2:]))
+                pillar_path *= (1.0 + 0.5 * coordination)
+            elif n >= 2:
+                pillar_path = 0.50 * active[0] + 0.35 * active[1]
+                pillar_path *= (1.0 + 0.25 * coordination)
+            elif n == 1:
+                pillar_path = 0.35 * active[0]
+
+            if weac_coherence > 0.7:
+                pillar_path *= (1.0 + 0.15 * (weac_coherence - 0.7))
+
+        score = max(tve_path, pillar_path)
 
         if gate_mode == "reancoreaza":
             score *= 0.7
